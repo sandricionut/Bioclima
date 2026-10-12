@@ -21,6 +21,10 @@ from .raster_registration import (
     read_registered_raster_window,
 )
 from .metadata import sidecar_path, write_json
+from .aoi import (
+    AOISelection, normalize_aoi, clip_profile_to_aoi, aoi_mask_for_window,
+    point_mask, buffered_geometry, transform_for_cropped_grid,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -125,6 +129,11 @@ def _process_raster_window_task(task: Mapping[str, Any]):
         ],
         axis=0,
     )
+    aoi_geojson = task.get("aoi_geojson")
+    if aoi_geojson is not None:
+        inside = aoi_mask_for_window(aoi_geojson, profile, window)
+        if inside is not None:
+            cube[:, ~inside] = nodata
     return task["window"], cube
 
 
@@ -228,6 +237,9 @@ class UAVMonitoringPipeline:
         registration_max_points: int = 250_000,
         initial_transforms: Mapping[str, np.ndarray] | None = None,
         registration_only: bool = False,
+        aoi: Any | None = None,
+        aoi_crs: str | None = None,
+        registration_scope: str = "full",
     ) -> dict[str, Any]:
         """Register and optionally fuse arbitrary point-cloud sources.
 
@@ -244,19 +256,46 @@ class UAVMonitoringPipeline:
         can also be selected with ``bands``. Registration is geometric; source
         variables are transferred without cross-variable arithmetic or unit
         conversion. Actual LAS/LAZ dimension names are never guessed.
+
+        ``aoi`` limits the fused output. By default ``registration_scope="full"``
+        estimates the geometric transform from the full available point-cloud
+        samples, so changing AOI does not change alignment. Use
+        ``registration_scope="aoi"`` only when a local transform is explicitly
+        intended; then registration samples are restricted to the AOI.
         """
         if not source_clouds:
             raise ValueError("At least one source point cloud is required")
+        registration_scope = str(registration_scope).lower().strip()
+        if registration_scope not in {"full", "aoi"}:
+            raise ValueError("registration_scope must be 'full' or 'aoi'")
         initial_transforms = dict(initial_transforms or {})
         reference_paths = _resolve_reference_point_paths(reference_path)
+
+        first_ref = reference_paths[0]
+        first_ref_crs = _point_input_crs(first_ref, reference_crs, self.config.crs)
+        first_ref_info = self.ingestion.inspect_point_cloud(
+            first_ref,
+            crs=first_ref_crs,
+            text_options=reference_text_options if first_ref.suffix.lower() in {".txt", ".csv", ".xyz"} else None,
+        )
+        resolved_reference_crs = reference_crs or first_ref_info.get("crs") or self.config.crs
+        aoi_selection = normalize_aoi(aoi, target_crs=resolved_reference_crs, aoi_crs=aoi_crs) if aoi is not None else None
+        if registration_scope == "aoi" and aoi_selection is None:
+            raise ValueError("registration_scope='aoi' requires an AOI")
+
+        sample_limit = int(registration_max_points) * (4 if registration_scope == "aoi" else 1)
         reference_sample = self._sample_reference_point_cloud(
             reference_paths,
-            max_points=registration_max_points,
+            max_points=sample_limit,
             source=reference_name,
             reference_crs=reference_crs,
             text_options=reference_text_options,
         )
         self._check_point_cloud_crs(reference_sample, reference_name)
+        if registration_scope == "aoi":
+            reference_sample = self._subset_point_cloud_to_aoi(
+                reference_sample, aoi_selection, max_points=registration_max_points
+            )
 
         registrations: dict[str, RegistrationResult] = {}
         specs: dict[str, dict[str, Any]] = {}
@@ -266,13 +305,28 @@ class UAVMonitoringPipeline:
             source_crs = _point_input_crs(spec["path"], spec.get("crs"), self.config.crs)
             moving_sample = self.ingestion.sample_point_cloud(
                 spec["path"],
-                max_points=registration_max_points,
+                max_points=sample_limit,
                 source=str(spec.get("source_name") or key),
                 crs=source_crs,
                 attributes=[],
                 text_options=spec.get("text_options"),
             )
             self._check_point_cloud_crs(moving_sample, key)
+            if registration_scope == "aoi":
+                registration_buffer = (
+                    float(max_correspondence_distance)
+                    if max_correspondence_distance is not None
+                    else max(float(voxel_size) * 4.0, 0.0)
+                )
+                moving_aoi = AOISelection(
+                    geometry=buffered_geometry(aoi_selection, registration_buffer),
+                    crs=aoi_selection.crs,
+                    source=f"{aoi_selection.source}:registration_buffer",
+                    input_crs=aoi_selection.input_crs,
+                )
+                moving_sample = self._subset_point_cloud_to_aoi(
+                    moving_sample, moving_aoi, max_points=registration_max_points
+                )
             _, reg = self.fusion.register_point_cloud(
                 reference_sample,
                 moving_sample,
@@ -286,6 +340,10 @@ class UAVMonitoringPipeline:
 
         if registration_only:
             qa = self.validation.registration_report(registrations, {})
+            qa["aoi"] = (
+                {**aoi_selection.to_metadata(), "registration_scope": registration_scope}
+                if aoi_selection is not None else {"enabled": False}
+            )
             report = self.validation.summary_report(point_cloud=qa)
             qa_path, report_path = self._write_reports(output_path, qa, report)
             return {
@@ -354,10 +412,15 @@ class UAVMonitoringPipeline:
                 max_distance=float(transfer_max_distance),
                 reference_crs=reference_crs or self.config.crs,
                 reference_text_options=reference_text_options,
+                aoi=aoi_selection,
             )
             transfer_stats = stream_meta["transfer_stats"]
             qa = self.validation.registration_report(registrations, transfer_stats)
             qa["streaming"] = stream_meta
+            qa["aoi"] = (
+                {**aoi_selection.to_metadata(), "registration_scope": registration_scope}
+                if aoi_selection is not None else {"enabled": False}
+            )
             report = self.validation.summary_report(point_cloud=qa)
             qa_path, report_path = self._write_reports(output_path, qa, report)
             metadata_path = self._write_point_cloud_metadata(
@@ -368,6 +431,8 @@ class UAVMonitoringPipeline:
                 variable_metadata=point_variable_metadata,
                 output_dimensions=stream_meta.get("output_dimensions", {}),
                 fusion_mode=mode,
+                aoi=aoi_selection,
+                registration_scope=registration_scope,
             )
             return {
                 "fused_cloud": None,
@@ -399,6 +464,8 @@ class UAVMonitoringPipeline:
             text_options=reference_text_options,
         )
         self._check_point_cloud_crs(reference, reference_name)
+        if aoi_selection is not None:
+            reference = self._subset_point_cloud_to_aoi(reference, aoi_selection)
 
         aligned_sources: dict[str, PointCloudData] = {}
         transfer_attributes: dict[str, list[str]] = {}
@@ -428,6 +495,20 @@ class UAVMonitoringPipeline:
                 output_names.append(output_name)
                 point_variable_metadata[output_name] = dict(variable_meta.get(output_name, {}))
             aligned = cloud.transformed(registrations[key].transformation)
+            if aoi_selection is not None:
+                source_geometry = buffered_geometry(
+                    aoi_selection,
+                    float(transfer_max_distance or 0.0) if mode == "reference_attributes" else 0.0,
+                )
+                keep = point_mask(aligned.xyz, source_geometry)
+                if np.any(keep):
+                    aligned = aligned.subset(keep)
+                else:
+                    aligned = PointCloudData(
+                        xyz=np.empty((0, 3), dtype=np.float64),
+                        attributes={name: np.empty((0,), dtype=np.asarray(values).dtype) for name, values in aligned.attributes.items()},
+                        crs=aligned.crs, source=aligned.source, metadata=dict(aligned.metadata),
+                    )
             aligned_sources[key] = aligned
             transfer_attributes[key] = output_names
             # Preserve the historical single-attribute naming while allowing
@@ -465,8 +546,14 @@ class UAVMonitoringPipeline:
             variable_metadata=point_variable_metadata,
             output_dimensions={},
             fusion_mode=mode,
+            aoi=aoi_selection,
+            registration_scope=registration_scope,
         ) if output_path else None
         qa = self.validation.registration_report(registrations, transfer_stats)
+        qa["aoi"] = (
+            {**aoi_selection.to_metadata(), "registration_scope": registration_scope}
+            if aoi_selection is not None else {"enabled": False}
+        )
         report = self.validation.summary_report(point_cloud=qa)
         qa_path, report_path = self._write_reports(output_path, qa, report)
         return {
@@ -529,7 +616,11 @@ class UAVMonitoringPipeline:
         include_original: bool = True,
         nodata: float = -9999.0,
         fine_transforms: Mapping[str, Any] | None = None,
+        fine_transform_grid: str = "full",
         band_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+        aoi: Any | None = None,
+        aoi_crs: str | None = None,
+        aoi_mask: bool = True,
     ) -> dict[str, Any]:
         """Fuse arbitrary rasters with bounded memory and parallel windows.
 
@@ -543,7 +634,7 @@ class UAVMonitoringPipeline:
 
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        specs, meta, profile = self.ingestion.plan_raster_grid(
+        specs, meta, full_profile = self.ingestion.plan_raster_grid(
             raster_sources,
             reference_key=reference_key,
             target_crs=target_crs,
@@ -551,10 +642,25 @@ class UAVMonitoringPipeline:
             extent=extent,
             nodata=nodata,
         )
-        fine_transforms = {
-            str(k): np.asarray(v, dtype=np.float64).tolist()
+        aoi_selection = normalize_aoi(aoi, target_crs=full_profile["crs"], aoi_crs=aoi_crs)
+        profile, crop_offset = clip_profile_to_aoi(full_profile, aoi_selection)
+        aoi_geojson = aoi_selection.geojson if (aoi_selection is not None and aoi_mask) else None
+
+        fine_transform_grid = str(fine_transform_grid).lower().strip()
+        if fine_transform_grid not in {"full", "output"}:
+            raise ValueError("fine_transform_grid must be 'full' or 'output'")
+        fine_transforms_raw = {
+            str(k): np.asarray(v, dtype=np.float64)
             for k, v in (fine_transforms or {}).items()
         }
+        if fine_transform_grid == "full" and crop_offset != (0, 0):
+            fine_transforms_raw = {
+                key: transform_for_cropped_grid(
+                    matrix, col_offset=crop_offset[0], row_offset=crop_offset[1]
+                )
+                for key, matrix in fine_transforms_raw.items()
+            }
+        fine_transforms = {key: matrix.tolist() for key, matrix in fine_transforms_raw.items()}
         unknown_transforms = [k for k in fine_transforms if k not in specs]
         if unknown_transforms:
             raise KeyError(f"Fine registration transforms refer to missing raster sources: {unknown_transforms}")
@@ -601,8 +707,11 @@ class UAVMonitoringPipeline:
                     resampling=resampling,
                     nodata=nodata,
                 )
+                inside = aoi_mask_for_window(aoi_geojson, profile, window) if aoi_geojson is not None else None
                 for key, arr in arrays.items():
                     valid = np.isfinite(arr) & ~np.isclose(arr, nodata)
+                    if inside is not None:
+                        valid &= inside
                     if np.any(valid):
                         sums[key] += float(np.sum(arr[valid], dtype=np.float64))
                         counts[key] += int(np.count_nonzero(valid))
@@ -634,6 +743,7 @@ class UAVMonitoringPipeline:
             "include_original": include_original,
             "band_names": band_names,
             "fine_transforms": fine_transforms,
+            "aoi_geojson": aoi_geojson,
         }
 
         with rasterio.open(output_path, "w", **out_profile) as dst:
@@ -713,6 +823,10 @@ class UAVMonitoringPipeline:
             "anomaly_references": anomaly_refs,
             "fine_registration_applied": bool(fine_transforms),
             "fine_transforms": fine_transforms,
+            "aoi": (
+                {**aoi_selection.to_metadata(), "mask_applied": bool(aoi_mask), "crop_offset_pixels": list(crop_offset)}
+                if aoi_selection is not None else {"enabled": False}
+            ),
             "processing": {
                 "streaming": True,
                 "parallel_backend": "process" if workers > 1 else "serial",
@@ -761,6 +875,10 @@ class UAVMonitoringPipeline:
         optimizer_maxiter: int = 40,
         raster_metadata: Mapping[str, Mapping[str, Any]] | None = None,
         nodata: float = -9999.0,
+        aoi: Any | None = None,
+        aoi_crs: str | None = None,
+        aoi_mask: bool = True,
+        registration_scope: str = "full",
     ) -> dict[str, Any]:
         """Multimodal co-registration and analysis-ready data fusion.
 
@@ -781,6 +899,13 @@ class UAVMonitoringPipeline:
         affine. The first model that passes the geometric constraints and local
         residual-consensus QA is selected. If no correction is defensible, the
         original georeferencing is retained unchanged.
+
+        ``aoi`` limits the output extent. With the default
+        ``registration_scope="full"``, registration is estimated on the full
+        available analysis grid and is therefore independent of the AOI. Set
+        ``registration_scope="aoi"`` only for an intentionally local alignment;
+        in that mode both the AOI crop and polygon mask participate in
+        registration.
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -792,7 +917,7 @@ class UAVMonitoringPipeline:
                 raise ValueError(f"Reference group {reference_group!r} has no raster keys")
             reference_key = str(ref_keys[0])
 
-        specs, source_meta, profile = self.ingestion.plan_raster_grid(
+        specs, source_meta, full_profile = self.ingestion.plan_raster_grid(
             raster_sources,
             reference_key=reference_key,
             target_crs=target_crs,
@@ -800,6 +925,14 @@ class UAVMonitoringPipeline:
             extent=extent,
             nodata=nodata,
         )
+        aoi_selection = normalize_aoi(aoi, target_crs=full_profile["crs"], aoi_crs=aoi_crs)
+        output_profile, crop_offset = clip_profile_to_aoi(full_profile, aoi_selection)
+        registration_scope = str(registration_scope).lower().strip()
+        if registration_scope not in {"full", "aoi"}:
+            raise ValueError("registration_scope must be 'full' or 'aoi'")
+        if registration_scope == "aoi" and aoi_selection is None:
+            raise ValueError("registration_scope='aoi' requires an AOI")
+        registration_profile = output_profile if registration_scope == "aoi" else full_profile
 
         # Source-group settings are product/acquisition specific and therefore
         # take precedence. If geometric accuracy is stored in the configured
@@ -817,14 +950,15 @@ class UAVMonitoringPipeline:
                     group["geometric_accuracy"] = dict(sensor_cfg["geometric_accuracy"])
 
         LOGGER.info(
-            "Multimodal registration: reference group %s; transform=%s; preview<=%d px",
+            "Multimodal registration: reference group %s; transform=%s; scope=%s; preview<=%d px",
             reference_group,
             registration_transform,
+            registration_scope,
             int(registration_preview_max_dimension),
         )
         fine_transforms, registration_results, key_to_group = estimate_multimodal_registrations(
             specs,
-            profile,
+            registration_profile,
             effective_source_groups,
             reference_group=reference_group,
             resampling=resampling,
@@ -841,12 +975,13 @@ class UAVMonitoringPipeline:
             max_shear_deg=float(max_shear_deg),
             refinement_translation_px=float(refinement_translation_px),
             optimizer_maxiter=int(optimizer_maxiter),
+            aoi_geojson=(aoi_selection.geojson if registration_scope == "aoi" and aoi_selection is not None else None),
         )
 
         band_metadata = self._build_raster_band_metadata(
             specs=specs,
             source_meta=source_meta,
-            profile=profile,
+            profile=output_profile,
             source_groups=effective_source_groups,
             key_to_group=key_to_group,
             reference_group=reference_group,
@@ -866,9 +1001,13 @@ class UAVMonitoringPipeline:
             include_original=True,
             nodata=nodata,
             fine_transforms=fine_transforms,
+            fine_transform_grid="output" if registration_scope == "aoi" else "full",
             band_metadata=band_metadata,
+            aoi=aoi_selection,
+            aoi_mask=aoi_mask,
         )
 
+        profile = output_profile
         transform = profile["transform"]
         pixel_size_x = float((float(transform.a) ** 2 + float(transform.d) ** 2) ** 0.5)
         pixel_size_y = float((float(transform.b) ** 2 + float(transform.e) ** 2) ** 0.5)
@@ -884,7 +1023,13 @@ class UAVMonitoringPipeline:
                 "require_local_consensus": bool(registration_require_local_consensus),
                 "accuracy_units": "analysis_grid_map_units",
                 "failure_safe": "identity transform retained when QA/constraints fail",
+                "registration_scope": registration_scope,
+                "aoi_influences_registration": bool(registration_scope == "aoi"),
             },
+            "aoi": (
+                {**aoi_selection.to_metadata(), "mask_applied": bool(aoi_mask), "crop_offset_pixels": list(crop_offset)}
+                if aoi_selection is not None else {"enabled": False}
+            ),
             "reference_group": str(reference_group),
             "reference_key": str(reference_key),
             "analysis_grid": {
@@ -894,6 +1039,12 @@ class UAVMonitoringPipeline:
                 "transform": tuple(profile["transform"]),
                 "pixel_size_x": pixel_size_x,
                 "pixel_size_y": pixel_size_y,
+            },
+            "registration_grid": {
+                "crs": str(registration_profile["crs"]),
+                "width": int(registration_profile["width"]),
+                "height": int(registration_profile["height"]),
+                "transform": tuple(registration_profile["transform"]),
             },
             "groups": {
                 str(reference_group): {
@@ -937,7 +1088,7 @@ class UAVMonitoringPipeline:
 
         metadata_payload = {
             "schema": "uav_biodiv.analysis_ready.v1",
-            "software": {"name": "uav-biodiv", "version": "0.8.0"},
+            "software": {"name": "uav-biodiv", "version": "0.9.1"},
             "fusion_method": "Multimodal co-registration and analysis-ready data fusion",
             "values": {
                 "cross_sensor_value_fusion": False,
@@ -951,6 +1102,10 @@ class UAVMonitoringPipeline:
                 "campaign_name": self.config.metadata.get("campaign_name"),
                 "output_prefix": self.config.output_prefix,
             },
+            "aoi": (
+                {**aoi_selection.to_metadata(), "mask_applied": bool(aoi_mask), "registration_scope": registration_scope}
+                if aoi_selection is not None else {"enabled": False}
+            ),
             "output": {
                 "path": str(output_path),
                 "crs": str(profile["crs"]),
@@ -1112,6 +1267,9 @@ class UAVMonitoringPipeline:
         keep_point_metrics_raster: bool = True,
         point_cloud_recursive: bool = False,
         nodata: float = -9999.0,
+        aoi: Any | None = None,
+        aoi_crs: str | None = None,
+        aoi_mask: bool = True,
     ) -> dict[str, Any]:
         """Rasterize point-cloud metrics and fuse them with raster sources.
 
@@ -1119,7 +1277,9 @@ class UAVMonitoringPipeline:
         LAS/LAZ tiles, a glob, or an explicit iterable of LAS/LAZ files. Tiled
         source clouds are streamed directly and are never merged into an
         intermediate point-cloud file. The caller explicitly selects the
-        source(s); the core does not filter inputs by filename.
+        source(s); the core does not filter inputs by filename. ``aoi`` can
+        restrict metric computation and the final fused raster to a study area
+        without clipping the input files first.
 
         The actual point-cloud dimension names are supplied through
         ``metric_attributes`` or configuration. Recognised semantic keys are
@@ -1130,7 +1290,7 @@ class UAVMonitoringPipeline:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        _, _, target_profile = self.ingestion.plan_raster_grid(
+        _, _, full_target_profile = self.ingestion.plan_raster_grid(
             raster_sources,
             reference_key=reference_key,
             target_crs=target_crs,
@@ -1138,6 +1298,10 @@ class UAVMonitoringPipeline:
             extent=extent,
             nodata=nodata,
         )
+        aoi_selection = normalize_aoi(
+            aoi, target_crs=full_target_profile["crs"], aoi_crs=aoi_crs
+        ) if aoi is not None else None
+        target_profile, _ = clip_profile_to_aoi(full_target_profile, aoi_selection)
 
         attrs = {str(k): str(v) for k, v in (metric_attributes or {}).items()}
         if point_sensor_name is not None:
@@ -1166,6 +1330,7 @@ class UAVMonitoringPipeline:
             intensity_attribute=attrs.get("intensity"),
             recursive=point_cloud_recursive,
             nodata=nodata,
+            aoi=aoi_selection,
         )
 
         point_metrics = tuple(dict.fromkeys(str(x) for x in point_metrics))
@@ -1190,6 +1355,8 @@ class UAVMonitoringPipeline:
             anomaly_references=anomaly_references,
             include_original=True,
             nodata=nodata,
+            aoi=aoi_selection,
+            aoi_mask=aoi_mask,
         )
         result["point_metrics_path"] = str(metrics_path)
         result["point_metrics_processing"] = metric_meta
@@ -1204,6 +1371,29 @@ class UAVMonitoringPipeline:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _subset_point_cloud_to_aoi(
+        cloud: PointCloudData,
+        aoi: AOISelection | None,
+        *,
+        max_points: int | None = None,
+    ) -> PointCloudData:
+        if aoi is None:
+            return cloud
+        mask = point_mask(cloud.xyz, aoi)
+        if not np.any(mask):
+            raise ValueError("AOI contains no points from a point-cloud registration sample")
+        subset = cloud.subset(mask)
+        if subset.n_points < 3:
+            raise ValueError("AOI contains fewer than three points; point-cloud registration is not possible")
+        if max_points is not None and subset.n_points > int(max_points):
+            idx = np.linspace(0, subset.n_points - 1, int(max_points), dtype=np.int64)
+            subset = subset.subset(idx)
+        subset.metadata = dict(subset.metadata)
+        subset.metadata["aoi_filtered"] = True
+        subset.metadata["aoi_bounds"] = list(aoi.bounds)
+        return subset
+
     def _sample_reference_point_cloud(
         self,
         paths: Iterable[Path],
@@ -1358,6 +1548,8 @@ class UAVMonitoringPipeline:
         variable_metadata: Mapping[str, Mapping[str, Any]],
         output_dimensions: Mapping[str, Any],
         fusion_mode: str,
+        aoi: AOISelection | None = None,
+        registration_scope: str = "full",
     ) -> Path | None:
         if output_path is None:
             return None
@@ -1381,9 +1573,13 @@ class UAVMonitoringPipeline:
             variables.append(item)
         payload = {
             "schema": "uav_biodiv.point_analysis_ready.v1",
-            "software": {"name": "uav-biodiv", "version": "0.8.0"},
+            "software": {"name": "uav-biodiv", "version": "0.9.1"},
             "fusion_method": "geometric point-cloud co-registration and attribute-preserving fusion",
             "fusion_mode": str(fusion_mode),
+            "aoi": (
+                {**aoi.to_metadata(), "registration_scope": str(registration_scope)}
+                if aoi is not None else {"enabled": False}
+            ),
             "project": {
                 "project_name": self.config.project_name,
                 "site_name": self.config.metadata.get("site_name"),

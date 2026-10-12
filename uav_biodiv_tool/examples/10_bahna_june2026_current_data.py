@@ -1,4 +1,4 @@
-"""BioClima campaign-specific test for v0.8.0.
+"""BioClima campaign-specific test for v0.9.1.
 
 The file paths are user-side inputs. Study-site and campaign names used in
 outputs come from UAVProjectConfig metadata; the processing core contains no
@@ -19,10 +19,13 @@ BAHNA_LAS = Path("bahna_las")
 BAHNA_RGB = Path("bahna_rgb.tif")
 BAHNA_THERMAL = Path("bahna_thermal.tif")
 BAHNA_OUTPUT = Path("bahna_output")
+# Optional AOI: None, bbox, vector path, GeoJSON or Shapely geometry.
+# With registration_scope="full" the AOI does not influence co-registration.
+BAHNA_AOI = None
 
 # Optional product-level geometric accuracy from the UAV processing report.
 # Values are in the analysis-grid map units (metres for EPSG:32634). Leave as
-# None when unavailable; v0.8.0 then uses a conservative native-resolution
+# None when unavailable; v0.9.1 then uses a conservative native-resolution
 # fallback and refuses corrections that hit that limit.
 RGB_RMS_X = None
 RGB_RMS_Y = None
@@ -116,6 +119,8 @@ def main() -> None:
         reference_key="rgb_red",
         output_path=analysis_ready_path,
         registration_transform="auto",
+        aoi=BAHNA_AOI,
+        registration_scope="full",
     )
     print("\nMultimodal raster processing")
     print(raster_result["qa"]["processing"])
@@ -143,6 +148,7 @@ def main() -> None:
         point_metrics=("point_count", "point_density", "z_mean", "z_std", "z_p95"),
         compute_indices=False,
         output_path=output_dir / f"{prefix}_imagery_lidar_analysis_ready.tif",
+        aoi=BAHNA_AOI,
     )
     print("\nPoint-raster processing")
     print(point_result["point_metrics_processing"])

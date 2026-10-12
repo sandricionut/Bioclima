@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use uav-biodiv in research, please cite the software and the BioClima project documentation associated with your workflow."
 title: "uav-biodiv"
 type: software
-version: 0.8.0
+version: 0.9.1
 date-released: 2026-10-12
 authors:
   - name: "BioClima contributors"

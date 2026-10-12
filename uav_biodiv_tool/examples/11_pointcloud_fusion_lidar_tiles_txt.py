@@ -31,7 +31,7 @@ def main() -> None:
                 "text_options": {
                     "delimiter": "whitespace",
                     "has_header": False,
-                    "columns": {"x": 0, "y": 1, "z": 2, "temperature": 3},
+                    "field_names": ["x", "y", "z", "temperature"],
                 },
                 "attributes": {
                     "temperature": {

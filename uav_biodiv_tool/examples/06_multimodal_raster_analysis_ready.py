@@ -69,7 +69,7 @@ def main() -> None:
         },
         reference_group="geometry_alpha",
         output_path=output_dir / f"{cfg.output_prefix}_analysis_ready.tif",
-        # v0.8.0 default: automatic conservative model selection.
+        # v0.9.0 default: automatic conservative model selection.
         registration_transform="auto",
     )
     print(result["metadata_path"])

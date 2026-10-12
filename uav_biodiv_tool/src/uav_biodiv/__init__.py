@@ -8,6 +8,7 @@ from .raster_registration import RasterRegistrationResult
 from .validation import ValidationReporting
 from .ebv_ecv import EBVECVDerivation
 from .ai import AIAnalytics
+from .aoi import AOISelection
 
 __all__ = [
     "UAVProjectConfig",
@@ -22,6 +23,7 @@ __all__ = [
     "ValidationReporting",
     "EBVECVDerivation",
     "AIAnalytics",
+    "AOISelection",
 ]
 
-__version__ = "0.8.0"
+__version__ = "0.9.1"

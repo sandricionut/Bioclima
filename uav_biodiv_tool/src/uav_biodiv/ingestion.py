@@ -720,16 +720,29 @@ class DataIngestionHarmonization:
     ) -> dict[str, Any]:
         """Resolve a generic numeric text point-cloud schema.
 
+        Version 0.9.1 makes the text schema explicit. For files without a
+        header, ``field_names`` is mandatory and must contain one name for
+        every column in the text file. For files with a header,
+        ``field_names`` is optional and, when supplied, renames the columns
+        without changing their order.
+
         Supported options:
-        ``delimiter``: ``"auto"`` (default), whitespace/``None``, comma, semicolon or tab;
+        ``delimiter``: ``"auto"`` (default), whitespace/``None``, comma,
+        semicolon or tab;
         ``has_header``: ``"auto"`` (default), ``True`` or ``False``;
-        ``columns``: mapping of logical names to zero-based indices or header names;
+        ``field_names``: ordered list containing exactly one name per text
+        column; required when the file has no header;
+        ``coordinate_fields``: mapping from logical ``x``, ``y`` and ``z``
+        to field names (or zero-based indexes). It is only needed when the
+        declared field names are not themselves x/y/z (case-insensitive);
+        ``columns``: legacy explicit logical-name mapping retained for
+        backwards compatibility;
         ``comment``: comment prefix (default ``#``);
         ``encoding``: text encoding (default UTF-8).
 
-        Coordinate logical names are ``x``, ``y`` and ``z``. All other mapped
-        columns become arbitrary point attributes. No sensor/band convention is
-        inferred.
+        Every non-empty, non-comment data row is checked against the declared
+        field count while streaming. No unnamed ``value_1``/``field_1`` style
+        attributes are created.
         """
         opts = dict(text_options or {})
         delimiter_opt = opts.get("delimiter", "auto")
@@ -737,6 +750,8 @@ class DataIngestionHarmonization:
         encoding = str(opts.get("encoding", "utf-8"))
         has_header_opt = opts.get("has_header", "auto")
         columns_opt = dict(opts.get("columns") or {})
+        coordinate_fields_opt = dict(opts.get("coordinate_fields") or {})
+        field_names_opt = opts.get("field_names")
 
         first_line = None
         first_line_number = 0
@@ -773,42 +788,86 @@ class DataIngestionHarmonization:
         else:
             has_header = bool(has_header_opt)
 
-        header_names = tokens if has_header else []
+        source_header_names = [str(x).strip() for x in tokens] if has_header else []
         n_columns_hint = len(tokens)
-        lower_header = {name.lower(): i for i, name in enumerate(header_names)}
+
+        if field_names_opt is None:
+            if not has_header:
+                raise ValueError(
+                    f"Text point cloud {path} has no header. "
+                    "text_options['field_names'] is required and must define "
+                    "one name for every text column."
+                )
+            field_names = list(source_header_names)
+        else:
+            if isinstance(field_names_opt, (str, bytes)):
+                raise TypeError("text_options['field_names'] must be a list/tuple of column names")
+            field_names = [str(name).strip() for name in field_names_opt]
+            if len(field_names) != n_columns_hint:
+                raise ValueError(
+                    f"TXT schema mismatch for {path}: first data/header row contains "
+                    f"{n_columns_hint} columns but field_names defines {len(field_names)} fields."
+                )
+
+        if any(not name for name in field_names):
+            raise ValueError("text_options['field_names'] cannot contain empty names")
+        lowered = [name.casefold() for name in field_names]
+        if len(set(lowered)) != len(lowered):
+            raise ValueError(
+                "text_options['field_names'] must be unique (case-insensitive). "
+                f"Received: {field_names}"
+            )
+
+        lower_fields = {name.casefold(): i for i, name in enumerate(field_names)}
+        lower_source_header = {name.casefold(): i for i, name in enumerate(source_header_names)}
 
         def resolve_column(value: Any, logical_name: str) -> int:
             if isinstance(value, (int, np.integer)):
                 idx = int(value)
             else:
-                text = str(value)
+                text = str(value).strip()
                 if text.isdigit():
                     idx = int(text)
-                elif has_header and text.lower() in lower_header:
-                    idx = int(lower_header[text.lower()])
+                elif text.casefold() in lower_fields:
+                    idx = int(lower_fields[text.casefold()])
+                elif has_header and text.casefold() in lower_source_header:
+                    # Allows a renamed field_names list while still accepting a
+                    # source-header name in legacy ``columns`` mappings.
+                    idx = int(lower_source_header[text.casefold()])
                 else:
                     raise KeyError(
                         f"Text column {value!r} for {logical_name!r} was not found. "
-                        f"Header columns: {header_names or 'none'}"
+                        f"Declared fields: {field_names}"
                     )
-            if idx < 0:
-                raise ValueError("Text column indexes must be zero-based non-negative integers")
+            if idx < 0 or idx >= n_columns_hint:
+                raise ValueError(
+                    f"Text column index {idx} for {logical_name!r} is outside "
+                    f"the valid range 0..{n_columns_hint - 1}"
+                )
             return idx
 
         coord_cols: dict[str, int] = {}
-        for coord, default_idx in (("x", 0), ("y", 1), ("z", 2)):
-            if coord in columns_opt:
+        for coord in ("x", "y", "z"):
+            if coord in coordinate_fields_opt:
+                coord_cols[coord] = resolve_column(coordinate_fields_opt[coord], coord)
+            elif coord in columns_opt:
                 coord_cols[coord] = resolve_column(columns_opt[coord], coord)
-            elif has_header and coord in lower_header:
-                coord_cols[coord] = int(lower_header[coord])
+            elif coord.casefold() in lower_fields:
+                coord_cols[coord] = int(lower_fields[coord.casefold()])
             else:
-                coord_cols[coord] = default_idx
+                raise ValueError(
+                    f"Cannot identify the {coord.upper()} coordinate in {path}. "
+                    "Either name the corresponding field x/y/z in field_names "
+                    "or provide text_options['coordinate_fields']."
+                )
 
-        if max(coord_cols.values()) >= n_columns_hint:
-            raise ValueError(f"Text point cloud requires X/Y/Z columns: {path}")
+        if len(set(coord_cols.values())) != 3:
+            raise ValueError(
+                f"X/Y/Z must refer to three distinct text columns. Resolved mapping: {coord_cols}"
+            )
 
         attribute_cols: dict[str, int] = {}
-        # Explicit mappings have priority and define stable semantic names.
+        # Legacy explicit mappings may rename selected non-coordinate fields.
         for name, value in columns_opt.items():
             lname = str(name)
             if lname.lower() in {"x", "y", "z"}:
@@ -817,15 +876,9 @@ class DataIngestionHarmonization:
 
         if not attribute_cols:
             coord_idx = set(coord_cols.values())
-            if has_header:
-                for idx, name in enumerate(header_names):
-                    if idx not in coord_idx:
-                        attribute_cols[str(name)] = idx
-            else:
-                # Preserve historical generic names for unlabelled numeric columns.
-                for idx in range(n_columns_hint):
-                    if idx not in coord_idx:
-                        attribute_cols[f"value_{idx - 2}"] = idx
+            for idx, name in enumerate(field_names):
+                if idx not in coord_idx:
+                    attribute_cols[str(name)] = idx
 
         public_delimiter = "whitespace" if delimiter is None else ("tab" if delimiter == "\t" else delimiter)
         return {
@@ -834,12 +887,21 @@ class DataIngestionHarmonization:
             "encoding": encoding,
             "has_header": bool(has_header),
             "skiprows": int(first_line_number if has_header else first_line_number - 1),
+            "expected_column_count": int(n_columns_hint),
+            "field_names": list(field_names),
+            "source_header_names": list(source_header_names),
             "coordinate_columns": coord_cols,
             "attribute_columns": attribute_cols,
             "attribute_names": list(attribute_cols),
             "public": {
                 "delimiter": public_delimiter,
                 "has_header": bool(has_header),
+                "field_names": list(field_names),
+                "source_header_names": list(source_header_names),
+                "coordinate_fields": {
+                    axis: field_names[index] for axis, index in coord_cols.items()
+                },
+                "column_count": int(n_columns_hint),
                 "columns": {**coord_cols, **attribute_cols},
             },
         }
@@ -879,9 +941,25 @@ class DataIngestionHarmonization:
         # Very large max_rows values cause avoidable parser/string memory spikes.
         chunk = max(1_000, min(chunk, 500_000))
         offset = 0
+        expected_columns = int(schema["expected_column_count"])
+
+        def validated_data_lines(fh):
+            for line_number, line in enumerate(fh, start=int(schema["skiprows"]) + 1):
+                stripped = line.strip()
+                if not stripped or (schema["comment"] and stripped.startswith(schema["comment"])):
+                    continue
+                tokens = self._split_text_line(stripped, schema["delimiter"])
+                if len(tokens) != expected_columns:
+                    raise ValueError(
+                        f"TXT schema mismatch in {path} at line {line_number}: "
+                        f"expected {expected_columns} columns from field_names, found {len(tokens)}."
+                    )
+                yield line
+
         with path.open("r", encoding=str(schema["encoding"]), errors="replace") as fh:
             for _ in range(int(schema["skiprows"])):
                 next(fh, None)
+            data_lines = validated_data_lines(fh)
             while True:
                 try:
                     with warnings.catch_warnings():
@@ -891,18 +969,20 @@ class DataIngestionHarmonization:
                             category=UserWarning,
                         )
                         arr = np.loadtxt(
-                            fh,
+                            data_lines,
                             dtype=np.float64,
                             delimiter=schema["delimiter"],
-                            comments=schema["comment"],
+                            comments=None,
                             usecols=unique_cols,
                             max_rows=chunk,
                             ndmin=2,
                         )
                 except ValueError as exc:
+                    if "TXT schema mismatch" in str(exc):
+                        raise
                     raise ValueError(
                         f"Could not parse numeric text point cloud {path}. "
-                        "Provide text_options with delimiter/has_header/columns when auto-detection is insufficient."
+                        "Check delimiter, field_names and coordinate_fields in text_options."
                     ) from exc
                 if arr.size == 0 or arr.shape[0] == 0:
                     break

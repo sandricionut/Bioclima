@@ -32,5 +32,7 @@ Thumbs.db
 # Local data and temporary outputs
 *.log
 *.tmp
-dev
+dev/
 arhive
+bahna_output/
+demo_data/

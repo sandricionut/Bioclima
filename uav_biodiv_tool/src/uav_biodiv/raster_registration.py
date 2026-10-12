@@ -242,6 +242,7 @@ def build_registration_preview(
     resampling: Mapping[str, str] | str = "bilinear",
     nodata: float = -9999.0,
     max_dimension: int = 512,
+    aoi_geojson: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build a normalized multimodal registration representation.
 
@@ -292,6 +293,22 @@ def build_registration_preview(
         where=count > 0,
     ).astype(np.float32)
     valid = count > 0
+    if aoi_geojson is not None:
+        from affine import Affine
+        from rasterio.features import geometry_mask
+
+        preview_transform = profile["transform"] * Affine.scale(
+            float(profile["width"]) / float(pw),
+            float(profile["height"]) / float(ph),
+        )
+        inside = geometry_mask(
+            [dict(aoi_geojson)],
+            out_shape=(ph, pw),
+            transform=preview_transform,
+            invert=True,
+            all_touched=False,
+        )
+        valid &= inside
     representation[~valid] = 0.0
     return representation, valid
 
@@ -1122,6 +1139,7 @@ def _multiscale_translation_candidate(
     local_residual_tolerance_px: float,
     local_dispersion_tolerance_px: float,
     local_min_windows: int,
+    aoi_geojson: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any], list[tuple[int, int]], tuple[float, float], tuple[float, float]]:
     """Conservative coarse-to-fine residual translation on the full grid."""
     current_dx_full = 0.0
@@ -1139,6 +1157,7 @@ def _multiscale_translation_candidate(
             resampling=resampling,
             nodata=nodata,
             max_dimension=int(dim),
+            aoi_geojson=aoi_geojson,
         )
         ph, pw = fixed.shape
         preview_shapes.append((ph, pw))
@@ -1330,6 +1349,7 @@ def estimate_multimodal_registrations(
     max_shear_deg: float = 0.10,
     refinement_translation_px: float = 2.0,
     optimizer_maxiter: int = 40,
+    aoi_geojson: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, RasterRegistrationResult], dict[str, str]]:
     """Estimate conservative fine co-registration transforms per source group.
 
@@ -1387,6 +1407,7 @@ def estimate_multimodal_registrations(
             resampling=resampling,
             nodata=nodata,
             max_dimension=dim,
+            aoi_geojson=aoi_geojson,
         )
 
     target_crs = profile.get("crs")
@@ -1440,6 +1461,7 @@ def estimate_multimodal_registrations(
             resampling=resampling,
             nodata=nodata,
             max_dimension=fine_dim,
+            aoi_geojson=aoi_geojson,
         )
         ph, pw = fixed_fine.shape
         fine_shape = (ph, pw)
@@ -1499,6 +1521,7 @@ def estimate_multimodal_registrations(
                     local_residual_tolerance_px=local_residual_tolerance_px,
                     local_dispersion_tolerance_px=local_dispersion_tolerance_px,
                     local_min_windows=local_min_windows,
+                    aoi_geojson=aoi_geojson,
                 )
                 tested.append(_candidate_summary("translation", t_qa))
                 if bool(t_qa["accepted"]):

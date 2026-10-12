@@ -521,6 +521,21 @@ class MultiSensorFusion:
         if missing:
             raise KeyError(f"Source attributes not found: {missing}")
 
+        if source.n_points == 0:
+            out = reference.copy(deep=True)
+            tag = f"{prefix}_" if prefix else ""
+            for attr in attrs:
+                out.attributes[f"{tag}{attr}"] = np.full(reference.n_points, np.nan, dtype=np.float64)
+            if include_distance:
+                out.attributes[f"{tag}nn_distance"] = np.full(reference.n_points, np.nan, dtype=np.float32)
+                out.attributes[f"{tag}matched"] = np.zeros(reference.n_points, dtype=np.uint8)
+            return out, {
+                "matched_fraction": 0.0,
+                "median_nn_distance": float("nan"),
+                "p95_nn_distance": float("nan"),
+                "max_distance": float(max_distance) if max_distance is not None else float("nan"),
+            }
+
         tree = cKDTree(source.xyz)
         distances, indices = tree.query(reference.xyz, k=k, workers=-1)
         if k == 1:
@@ -786,6 +801,7 @@ def stream_reference_attribute_fusion(
     max_distance: float,
     reference_crs: str | None = None,
     reference_text_options: Mapping[str, Any] | None = None,
+    aoi: Any | None = None,
 ) -> dict[str, Any]:
     """Out-of-core nearest-neighbour transfer of arbitrary point attributes.
 
@@ -803,6 +819,7 @@ def stream_reference_attribute_fusion(
     from pathlib import Path
     import shutil
     import tempfile
+    from .aoi import point_mask, buffered_geometry
 
     try:
         import laspy
@@ -884,6 +901,16 @@ def stream_reference_attribute_fusion(
                     raise ValueError("Reference point-cloud files use different CRS definitions") from exc
     if total_ref <= 0 or not np.all(np.isfinite(ref_min[:2])) or not np.all(np.isfinite(ref_max[:2])):
         raise ValueError("Reference point cloud has no valid points/bounds")
+
+    if aoi is not None:
+        from shapely.geometry import box
+
+        overlap = box(float(ref_min[0]), float(ref_min[1]), float(ref_max[0]), float(ref_max[1])).intersection(aoi.geometry)
+        if overlap.is_empty:
+            raise ValueError("AOI does not overlap the reference point cloud")
+        minx, miny, maxx, maxy = map(float, overlap.bounds)
+        ref_min[0], ref_min[1] = minx, miny
+        ref_max[0], ref_max[1] = maxx, maxy
 
     margin = float(max_distance) * 1.5
     origin_x = float(ref_min[0] - margin)
@@ -995,6 +1022,7 @@ def stream_reference_attribute_fusion(
             transform = np.asarray(spec["transformation"], dtype=np.float64)
             if transform.shape != (4, 4):
                 raise ValueError(f"Source {source_name!r} transformation must be 4x4")
+            source_aoi = buffered_geometry(aoi, float(max_distance)) if aoi is not None else None
             count = 0
             for chunk in ingestion.iter_point_cloud_chunks(
                 spec["path"],
@@ -1013,8 +1041,13 @@ def stream_reference_attribute_fusion(
                     resolved[output_name] = actual
 
                 xyz = _apply_transform(chunk.xyz, transform)
+                if source_aoi is not None:
+                    aoi_inside = point_mask(xyz, source_aoi)
+                else:
+                    aoi_inside = np.ones(len(xyz), dtype=bool)
                 inside = (
-                    (xyz[:, 0] >= origin_x)
+                    aoi_inside
+                    & (xyz[:, 0] >= origin_x)
                     & (xyz[:, 0] < origin_x + nx * tile_side)
                     & (xyz[:, 1] >= origin_y)
                     & (xyz[:, 1] < origin_y + ny * tile_side)
@@ -1089,8 +1122,19 @@ def stream_reference_attribute_fusion(
             for source_name in sources
         }
 
+        reference_written = 0
+
         def process_reference_chunk(ref_xyz: np.ndarray, ref_points: Any | None, writer: Any) -> None:
+            nonlocal reference_written
+            if aoi is not None:
+                keep = point_mask(ref_xyz, aoi)
+                if not np.any(keep):
+                    return
+                ref_xyz = ref_xyz[keep]
+                if ref_points is not None:
+                    ref_points = ref_points[keep]
             n_ref = len(ref_xyz)
+            reference_written += int(n_ref)
             tx = np.floor((ref_xyz[:, 0] - origin_x) / tile_side).astype(np.int64)
             ty = np.floor((ref_xyz[:, 1] - origin_y) / tile_side).astype(np.int64)
             valid_tile = (tx >= 0) & (tx < nx) & (ty >= 0) & (ty < ny)
@@ -1213,15 +1257,24 @@ def stream_reference_attribute_fusion(
             parts = distance_values.get(source_name, [])
             distances = np.concatenate(parts) if parts else np.array([], dtype=np.float32)
             stats[source_name] = {
-                "matched_fraction": (matched_counts[source_name] / total_ref) if total_ref else 0.0,
+                "matched_fraction": (matched_counts[source_name] / reference_written) if reference_written else 0.0,
                 "median_nn_distance": float(np.median(distances)) if distances.size else float("nan"),
                 "p95_nn_distance": float(np.percentile(distances, 95)) if distances.size else float("nan"),
                 "max_distance": float(max_distance),
             }
 
+        if reference_written <= 0:
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+            raise ValueError("AOI contains no reference points")
+
         return {
             "output_path": str(output_path),
-            "reference_points": int(total_ref),
+            "reference_points": int(reference_written),
+            "reference_points_header_total": int(total_ref),
+            "aoi": ({**aoi.to_metadata(), "output_filtered": True} if aoi is not None else {"enabled": False}),
             "reference_files": [str(p) for p in reference_files],
             "reference_file_count": len(reference_files),
             "reference_records_preserved": bool(preserve_reference_records),

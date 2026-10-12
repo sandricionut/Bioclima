@@ -638,6 +638,7 @@ def rasterize_lidar_metrics_files(
     intensity_attribute: str | None = None,
     recursive: bool = False,
     nodata: float = -9999.0,
+    aoi: Any | None = None,
 ) -> dict[str, Any]:
     """Stream one or many LAS/LAZ tiles directly to raster metrics.
 
@@ -659,6 +660,7 @@ def rasterize_lidar_metrics_files(
     from concurrent.futures import wait, FIRST_COMPLETED
     import rasterio
     from rasterio.windows import Window
+    from ..aoi import point_mask, aoi_mask_for_window
 
     source_paths = resolve_lidar_sources(
         lidar_paths, recursive=recursive
@@ -766,6 +768,11 @@ def rasterize_lidar_metrics_files(
                 crs=None,
                 attributes=attributes,
             ):
+                if aoi is not None:
+                    keep = point_mask(chunk.xyz, aoi)
+                    if not np.any(keep):
+                        continue
+                    chunk = chunk.subset(keep)
                 idx, rows, cols, _ = _point_cells(chunk, reference_profile)
                 if idx.size == 0:
                     continue
@@ -855,10 +862,15 @@ def rasterize_lidar_metrics_files(
                 for col_off in range(0, width, tile_size):
                     w0 = min(tile_size, width - col_off)
                     fill = np.full((len(metrics), h0, w0), float(nodata), dtype=np.float32)
+                    out_window = Window(col_off, row_off, w0, h0)
+                    inside = aoi_mask_for_window(aoi.geojson, reference_profile, out_window) if aoi is not None else None
                     for bi, metric in enumerate(metrics):
                         if metric in {"point_count", "point_density"}:
-                            fill[bi].fill(0.0)
-                    dst.write(fill, window=Window(col_off, row_off, w0, h0))
+                            if inside is None:
+                                fill[bi].fill(0.0)
+                            else:
+                                fill[bi][inside] = 0.0
+                    dst.write(fill, window=out_window)
 
             def make_task(tid: int, tpath: Path) -> dict[str, Any]:
                 task = dict(task_base)
@@ -870,6 +882,9 @@ def rasterize_lidar_metrics_files(
                 for tid, tpath in tile_files.items():
                     _, row_off, col_off, cube = _compute_lidar_metric_tile_task(make_task(tid, tpath))
                     window = Window(col_off, row_off, cube.shape[2], cube.shape[1])
+                    if aoi is not None:
+                        inside = aoi_mask_for_window(aoi.geojson, reference_profile, window)
+                        cube[:, ~inside] = float(nodata)
                     dst.write(cube, window=window)
             else:
                 with process_pool(workers) as executor:
@@ -891,6 +906,9 @@ def rasterize_lidar_metrics_files(
                         for future in done:
                             _, row_off, col_off, cube = future.result()
                             window = Window(col_off, row_off, cube.shape[2], cube.shape[1])
+                            if aoi is not None:
+                                inside = aoi_mask_for_window(aoi.geojson, reference_profile, window)
+                                cube[:, ~inside] = float(nodata)
                             dst.write(cube, window=window)
                         submit_more()
 
@@ -903,6 +921,7 @@ def rasterize_lidar_metrics_files(
             "source_files": [str(p) for p in source_paths],
             "source_info": source_info,
             "source_points_in_grid": source_points_in_grid,
+            "aoi": ({**aoi.to_metadata(), "mask_applied": True} if aoi is not None else {"enabled": False}),
             "point_count_header": point_count,
             "points_in_grid": int(spooled_points),
             "tile_size": int(tile_size),

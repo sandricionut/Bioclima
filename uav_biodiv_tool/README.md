@@ -1,5 +1,17 @@
 # uav-biodiv
 
+## v0.9.1 API contract
+
+The synchronized v0.9.1 build supports AOI-aware raster **and point-cloud** fusion.
+`UAVMonitoringPipeline.run_point_cloud_fusion(...)` accepts `aoi`, `aoi_crs`, and
+`registration_scope`; `run_multimodal_point_cloud_fusion(...)` forwards these options.
+Headerless TXT point clouds require explicit `field_names`, and the demo separates the
+complete TXT schema from the subset of fields transferred to the LiDAR reference.
+
+The Bahna demo uses `gdown` to download `Bahna_demo.zip` and resolves the demo files
+recursively, ignoring `__MACOSX` metadata directories.
+
+
 `uav_biodiv` is a sensor-agnostic Python toolkit developed in the BioClima project for **multimodal UAV co-registration, analysis-ready data fusion, and EBV/ECV-oriented processing**.
 
 The package keeps physical variables separate and traceable. Fusion means geometric co-registration, harmonisation and attribute-preserving integration; it does **not** silently mix thermal, RGB, multispectral, LiDAR or other measurements into unitless synthetic values.
@@ -14,17 +26,29 @@ Three processing branches are supported:
 2. **Raster → raster** multimodal co-registration and variable-preserving stacking.
 3. **Point cloud → raster metrics → raster fusion** on a common analysis grid.
 
-## Version 0.8.0 highlights
+## Version 0.9.1 highlights
 
-Version 0.8.0 adds a streaming point-cloud ingestion/fusion layer for **LAS/LAZ and numeric TXT/CSV/XYZ** files.
+Version 0.9.1 makes the schema of headerless TXT/CSV/XYZ point clouds explicit and reproducible.
 
-- A thermal or other photogrammetric point cloud can be used directly from a TXT export; manual TXT → LAS conversion is not required.
-- TXT coordinate and attribute columns are declared explicitly.
-- TXT data are streamed in bounded chunks and participate in the same geometric registration and nearest-neighbour attribute transfer used for LAS/LAZ.
-- A directory of original LAS/LAZ reference tiles can be used directly for point-cloud fusion, avoiding a potentially problematic externally merged reference cloud.
-- The fused analysis-ready point cloud is written as LAS/LAZ. User variables are stored as LAS Extra Bytes dimensions together with transfer-distance and matched/not-matched QA dimensions.
-- CRS, variable units, provenance, registration information and transfer QA are written to sidecar metadata/QA files.
-- Raster outputs continue to use `BIGTIFF=YES` to avoid the classic TIFF 4 GiB limit.
+- `text_options["field_names"]` is required when the text file has no header.
+- `field_names` must contain exactly one name for every column in the text file.
+- Every streamed data row is validated against that column count; mismatches raise a clear error instead of being silently accepted.
+- `field_names` may also be supplied for files with a header to rename all columns while preserving their order.
+- If coordinate fields are not named `x`, `y`, `z` (case-insensitive), `coordinate_fields` explicitly maps the user-defined names to X/Y/Z.
+- Unnamed fallback fields such as `field1`/`value_1` are no longer created for headerless point clouds.
+- The resolved schema is stored in point-cloud metadata.
+
+Version 0.9.0 added an optional **Area of Interest (AOI)** to raster, LiDAR-raster and point-cloud fusion without requiring users to permanently clip their source datasets first.
+
+- An AOI can be supplied as a bounding box, vector dataset, GeoJSON, Shapely geometry or GeoPandas object.
+- Raster outputs are cropped to the AOI bounding grid and polygon AOIs are masked outside the geometry.
+- LiDAR raster metrics are computed only for the AOI processing grid; source points outside the AOI are ignored.
+- Point-cloud fusion writes only reference points inside the AOI and only spools source points needed near that AOI.
+- **AOI does not change co-registration by default.** `registration_scope="full"` estimates alignment from the complete available overlap and applies that transform to the AOI output.
+- `registration_scope="aoi"` is available when the scientific objective is explicitly a local alignment. In that mode the AOI participates in registration and the resulting transform should be interpreted as local to that AOI.
+- AOI definition, CRS, bounds, masking and registration scope are recorded in metadata/QA sidecars.
+
+The streaming LAS/LAZ and numeric TXT/CSV/XYZ point-cloud support introduced in v0.8.0 is retained. All GeoTIFF outputs continue to use `BIGTIFF=YES`.
 
 ## Installation
 
@@ -34,7 +58,7 @@ The project intentionally uses one installation command:
 python -m pip install -e .
 ```
 
-The repository keeps only the focused v0.8.0 tests (TXT/LAS point-cloud input and fusion). Run them with:
+The repository keeps a small focused test set for the current point-cloud and AOI functionality. Run it with:
 
 ```bash
 python -m pytest -v
@@ -47,6 +71,94 @@ python -m build
 ```
 
 The package requires Python 3.10 or newer.
+
+## Area of Interest (AOI)
+
+Using an AOI is recommended when only a subset of a large acquisition is needed. The source data do not need to be manually clipped first, so provenance is retained and the same inputs can be reused for different study areas.
+
+The important distinction is between **fusion extent** and **registration extent**:
+
+```text
+source datasets
+      │
+      ├── registration_scope="full"  (default)
+      │       alignment estimated from full available overlap
+      │
+      └── AOI
+              output cropped/masked to study area
+```
+
+This default makes the estimated alignment independent of the chosen AOI. It is the recommended mode for products that should share one consistent geometric correction.
+
+Use `registration_scope="aoi"` only when a local transform is scientifically justified, for example when residual geometric distortion changes spatially and the final analysis is intentionally restricted to one local area. In that mode changing the AOI can change the estimated transform.
+
+### Raster AOI
+
+```python
+result = pipeline.run_multimodal_raster_fusion(
+    raster_sources={
+        "channel_1": ("source_a.tif", 1),
+        "channel_2": ("source_b.tif", 1),
+    },
+    source_groups={
+        "geometry_a": {"keys": ["channel_1"]},
+        "geometry_b": {"keys": ["channel_2"]},
+    },
+    reference_group="geometry_a",
+    output_path="analysis_ready_aoi.tif",
+    aoi=(500000, 4600000, 500500, 4600500),
+    aoi_crs="EPSG:32634",
+    registration_scope="full",   # AOI does not influence alignment
+)
+```
+
+A polygon/vector AOI is also supported:
+
+```python
+result = pipeline.run_multimodal_raster_fusion(
+    ...,
+    aoi="study_area.gpkg",
+    registration_scope="full",
+)
+```
+
+Raster outputs are snapped to the original analysis grid. Polygon areas outside the AOI are written as NoData rather than creating a new arbitrary pixel alignment.
+
+### Point-cloud AOI
+
+```python
+result = pipeline.run_multimodal_point_cloud_fusion(
+    reference_path="reference_tiles",
+    source_clouds={
+        "source_variable": {
+            "path": "source_points.txt",
+            "crs": "EPSG:32634",
+            "text_options": {
+                "has_header": False,
+                "field_names": ["x", "y", "z", "value"],
+            },
+            "attributes": {
+                "value": {"dimension": "value", "unit": "user_defined"}
+            },
+        }
+    },
+    output_path="analysis_ready_aoi.laz",
+    aoi="study_area.gpkg",
+    registration_scope="full",
+)
+```
+
+For point-cloud attribute transfer, reference points are retained only inside the AOI. Source points in a small buffer around the AOI are retained internally so reference points near the boundary can still find valid nearest neighbours.
+
+Supported AOI inputs are:
+
+- `(minx, miny, maxx, maxy)` bounding box;
+- vector path readable by GeoPandas;
+- GeoJSON geometry/Feature/FeatureCollection;
+- Shapely geometry;
+- GeoPandas GeoSeries/GeoDataFrame.
+
+For geometries without an embedded CRS, provide `aoi_crs`. The package does not guess coordinate reference systems.
 
 ## Quick start: TXT point cloud + LAS/LAZ reference
 
@@ -79,12 +191,7 @@ result = pipeline.run_multimodal_point_cloud_fusion(
             "text_options": {
                 "delimiter": "whitespace",
                 "has_header": False,
-                "columns": {
-                    "x": 0,
-                    "y": 1,
-                    "z": 2,
-                    "temperature": 3,
-                },
+                "field_names": ["x", "y", "z", "temperature"],
             },
             "attributes": {
                 "temperature": {
@@ -109,22 +216,41 @@ For a header such as:
 X,Y,Z,Temperature
 ```
 
-use:
+use the header directly:
 
 ```python
 "text_options": {
     "delimiter": ",",
     "has_header": True,
-    "columns": {
-        "x": "X",
-        "y": "Y",
-        "z": "Z",
-        "temperature": "Temperature",
+}
+```
+
+To rename those four source columns while preserving their order:
+
+```python
+"text_options": {
+    "delimiter": ",",
+    "has_header": True,
+    "field_names": ["x", "y", "z", "temperature_surface"],
+}
+```
+
+If the user-defined field names do not use x/y/z, declare which fields carry the coordinates:
+
+```python
+"text_options": {
+    "delimiter": "whitespace",
+    "has_header": False,
+    "field_names": ["easting", "northing", "elevation", "temperature"],
+    "coordinate_fields": {
+        "x": "easting",
+        "y": "northing",
+        "z": "elevation",
     },
 }
 ```
 
-`delimiter="auto"` and `has_header="auto"` are also available, but explicit schemas are recommended for reproducible scientific workflows.
+`delimiter="auto"` and `has_header="auto"` are available, but a headerless file still requires `field_names`. Explicit schemas are recommended for reproducible scientific workflows.
 
 TXT/CSV/XYZ files do not normally store a CRS. Supply it through the source specification or project configuration. The package does not guess a CRS.
 
@@ -170,7 +296,7 @@ result = pipeline.run_multimodal_point_cloud_fusion(
             "path": r"D:\data\thermal_points.txt",
             "text_options": {
                 "has_header": False,
-                "columns": {"x": 0, "y": 1, "z": 2, "temperature": 3},
+                "field_names": ["x", "y", "z", "temperature"],
             },
             "attributes": {
                 "temperature": {"dimension": "temperature", "unit": "degC"}
@@ -315,7 +441,8 @@ The `examples/` directory contains executable templates:
 - `08_pointcloud_fusion_txt_source.py` — TXT physical variable → LAS/LAZ reference;
 - `09_pointcloud_fusion_las_source.py` — LAS Extra Bytes variable → reference;
 - `10_bahna_june2026_current_data.py` — project-specific raster/LiDAR workflow example;
-- `11_pointcloud_fusion_lidar_tiles_txt.py` — original LiDAR tiles + TXT source cloud.
+- `11_pointcloud_fusion_lidar_tiles_txt.py` — original LiDAR tiles + TXT source cloud;
+- `12_aoi_fusion.py` — AOI-limited raster and point-cloud fusion with global-vs-local registration scope.
 
 ## Repository layout
 
