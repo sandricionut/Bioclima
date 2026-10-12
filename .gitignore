@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build / packaging intermediates
+build/
+*.egg-info/
+.eggs/
+
+# Keep release artifacts in dist/ intentionally
+# dist/ is versioned in this repository
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local data and temporary outputs
+*.log
+*.tmp
+dev
+arhive

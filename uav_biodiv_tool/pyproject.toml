@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uav-biodiv"
+version = "0.8.0"
+description = "BioClima multi-sensor UAV fusion and EBV/ECV processing toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "BioClima / University of Bucharest"}]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["UAV", "biodiversity", "remote sensing", "LiDAR", "thermal", "data fusion"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "rasterio>=1.3",
+  "geopandas>=0.14",
+  "scikit-learn>=1.3",
+  "pyproj>=3.6",
+  "laspy[lazrs]>=2.5",
+  "plyfile>=1.0",
+  "psutil>=5.9",
+  "open3d>=0.18",
+  "pytest>=8.0",
+  "build>=1.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["uav_biodiv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
