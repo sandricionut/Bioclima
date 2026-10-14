@@ -14,6 +14,83 @@ from ..execution import process_pool
 LOGGER = logging.getLogger(__name__)
 
 
+# Optional LiDAR sensor presets. They provide acquisition metadata only; no
+# LAS/LAZ dimension names are guessed by the core.
+LIDAR_SENSORS: dict[str, dict[str, Any]] = {
+    "dji_zenmuse_l2": {
+        "sensor_type": "lidar",
+        "manufacturer": "DJI",
+        "model": "Zenmuse L2",
+        "laser_wavelength_nm": 905.0,
+        "maximum_returns": 5,
+        "scan_modes": ["repetitive", "non_repetitive"],
+        "point_rate_single_return_pts_s": 240000,
+        "point_rate_multiple_returns_pts_s": 1200000,
+        "detection_range_m": {
+            "10_percent_reflectivity_100klx": 250.0,
+            "50_percent_reflectivity_0klx": 450.0,
+        },
+        "system_accuracy_cm_at_150m": {
+            "horizontal": 5.0,
+            "vertical": 4.0,
+        },
+        "ranging_accuracy_rms_cm_at_150m": 2.0,
+        "fov_deg": {
+            "repetitive": {"horizontal": 70.0, "vertical": 3.0},
+            "non_repetitive": {"horizontal": 70.0, "vertical": 75.0},
+        },
+        "recommended_operating_altitude_m": [30.0, 150.0],
+        "point_attributes": {},
+        "notes": (
+            "Preset intentionally does not assign LAS/LAZ dimension names. "
+            "Actual height, classification and intensity dimensions remain "
+            "explicit user/configuration choices."
+        ),
+        "reference": "DJI Zenmuse L2 official specifications",
+        "reference_url": "https://www.dji.com/support/product/zenmuse-l2",
+    },
+}
+
+
+def get_lidar_sensor(sensor: str | Mapping[str, Any]) -> dict[str, Any]:
+    """Return a defensive copy of a LiDAR sensor definition."""
+    from copy import deepcopy
+
+    if isinstance(sensor, Mapping):
+        return deepcopy(dict(sensor))
+    key = str(sensor).strip().lower()
+    try:
+        return deepcopy(LIDAR_SENSORS[key])
+    except KeyError as exc:
+        raise KeyError(
+            f"Unknown LiDAR sensor {sensor!r}. "
+            f"Available presets: {sorted(LIDAR_SENSORS)}"
+        ) from exc
+
+
+def register_lidar_sensor(
+    config: Any,
+    sensor: str | Mapping[str, Any],
+    *,
+    name: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Register a LiDAR preset without imposing point-dimension names."""
+    definition = get_lidar_sensor(sensor)
+    sensor_name = name or (
+        str(sensor) if isinstance(sensor, str) else str(definition.get("model", "lidar_sensor"))
+    )
+    sensor_type = definition.pop("sensor_type", "lidar")
+    point_attributes = definition.pop("point_attributes", None)
+    return config.add_sensor(
+        sensor_name,
+        sensor_type=sensor_type,
+        point_attributes=point_attributes,
+        overwrite=overwrite,
+        **definition,
+    )
+
+
 def compute_chm_from_dsm_dtm(
     dsm_path: str | Path,
     dtm_path: str | Path,
@@ -38,6 +115,10 @@ def compute_chm_from_dsm_dtm(
         ):
             raise ValueError("DSM and DTM must already be aligned")
         profile = dsm_src.profile.copy()
+        # Source strip/block sizes may be invalid after switching to tiled
+        # output (GeoTIFF tile dimensions must be multiples of 16).
+        profile.pop("blockxsize", None)
+        profile.pop("blockysize", None)
         profile.update(
             dtype="float32", count=1, nodata=-9999.0, compress="deflate",
             tiled=True, BIGTIFF="YES"

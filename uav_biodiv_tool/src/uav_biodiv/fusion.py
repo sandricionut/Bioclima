@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 import logging
 
@@ -9,6 +10,11 @@ from scipy.spatial import cKDTree
 
 from .ingestion import PointCloudData
 from .execution import process_pool
+from .sensors.multispectral import (
+    get_multispectral_sensor,
+    multispectral_band_map,
+    multispectral_index_definitions,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -159,6 +165,135 @@ class MultiSensorFusion:
                 )
             out[str(index_name)] = value.astype(np.float32, copy=False)
         return out
+
+    @staticmethod
+    def compute_vegetation_indices(
+        features: Mapping[str, np.ndarray],
+        definitions: Mapping[str, Mapping[str, Any]],
+        *,
+        nodata: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Semantic alias for :meth:`compute_indices`.
+
+        The implementation remains fully generic; the alias exists for
+        backwards-compatible documentation and vegetation-focused workflows.
+        """
+        return MultiSensorFusion.compute_indices(
+            features, definitions, nodata=nodata
+        )
+
+    @staticmethod
+    def load_multispectral(
+        path: str | Path,
+        *,
+        sensor: str | Mapping[str, Any] | None = None,
+        band_map: Mapping[str, int] | None = None,
+        masked: bool = False,
+    ) -> dict[str, np.ndarray]:
+        """Load a multispectral raster using an optional sensor preset.
+
+        Parameters
+        ----------
+        sensor
+            Built-in preset name or an explicit sensor-definition mapping.
+            ``None`` keeps the loader generic. In that case ``band_map`` may
+            be supplied explicitly; otherwise generic ``band_1``, ``band_2``
+            ... names are returned.
+        band_map
+            Optional ``{output_name: raster_band_index}``. It overrides the
+            preset order and is the recommended route for custom exports.
+        """
+        import rasterio
+
+        path = Path(path)
+        if band_map is None and sensor is not None:
+            band_map = multispectral_band_map(sensor)
+
+        with rasterio.open(path) as src:
+            if band_map is None:
+                band_map = {
+                    f"band_{i}": i
+                    for i in range(1, int(src.count) + 1)
+                }
+
+            out: dict[str, np.ndarray] = {}
+            for name, band in band_map.items():
+                band = int(band)
+                if band < 1 or band > src.count:
+                    raise ValueError(
+                        f"Band {band} for {name!r} is outside raster range "
+                        f"1..{src.count}: {path}"
+                    )
+                values = src.read(band, masked=masked)
+                out[str(name)] = values
+
+        return out
+
+    @staticmethod
+    def load_dji_m3m_multispectral(
+        path: str | Path,
+        *,
+        sensor: str | Mapping[str, Any] = "dji_mavic_3m",
+        band_map: Mapping[str, int] | None = None,
+        masked: bool = False,
+    ) -> dict[str, np.ndarray]:
+        """Compatibility wrapper for DJI Mavic 3M-style data.
+
+        ``sensor`` is deliberately configurable so the implementation remains
+        reusable and does not hard-code processing behaviour to one platform.
+        """
+        return MultiSensorFusion.load_multispectral(
+            path, sensor=sensor, band_map=band_map, masked=masked
+        )
+
+    @staticmethod
+    def compute_multispectral_indices(
+        features: Mapping[str, np.ndarray],
+        *,
+        sensor: str | Mapping[str, Any] | None = None,
+        indices: Iterable[str] | None = None,
+        definitions: Mapping[str, Mapping[str, Any]] | None = None,
+        nodata: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Compute indices using explicit definitions or an optional preset."""
+        if definitions is None:
+            if sensor is None:
+                raise ValueError(
+                    "Provide either sensor=... or explicit index definitions"
+                )
+            definitions = multispectral_index_definitions(sensor)
+
+        resolved = {str(k): dict(v) for k, v in definitions.items()}
+        if indices is not None:
+            requested = [str(name).lower() for name in indices]
+            lookup = {str(k).lower(): str(k) for k in resolved}
+            missing = [name for name in requested if name not in lookup]
+            if missing:
+                raise KeyError(
+                    f"Requested indices are not defined: {missing}. "
+                    f"Available: {sorted(resolved)}"
+                )
+            resolved = {lookup[name]: resolved[lookup[name]] for name in requested}
+
+        return MultiSensorFusion.compute_indices(
+            features, resolved, nodata=nodata
+        )
+
+    @staticmethod
+    def compute_dji_m3m_indices(
+        features: Mapping[str, np.ndarray],
+        *,
+        sensor: str | Mapping[str, Any] = "dji_mavic_3m",
+        indices: Iterable[str] = ("ndvi", "gndvi", "ndre"),
+        nodata: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Compatibility wrapper for the Mavic 3M vegetation-index preset."""
+        return MultiSensorFusion.compute_multispectral_indices(
+            features,
+            sensor=sensor,
+            indices=indices,
+            nodata=nodata,
+        )
 
     @staticmethod
     def compute_thermal_anomaly(

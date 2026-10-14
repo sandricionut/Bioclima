@@ -14,7 +14,16 @@ from .fusion import MultiSensorFusion, RegistrationResult, stream_reference_attr
 from .validation import ValidationReporting
 from .ebv_ecv import EBVECVDerivation
 from .ai import AIAnalytics
-from .sensors.lidar import rasterize_lidar_metrics_files
+from .sensors.lidar import (
+    compute_chm_from_dsm_dtm,
+    get_lidar_sensor,
+    rasterize_lidar_metrics_files,
+)
+from .sensors.multispectral import (
+    get_multispectral_sensor,
+    multispectral_band_map,
+    multispectral_index_definitions,
+)
 from .execution import process_pool, window_to_tuple
 from .raster_registration import (
     estimate_multimodal_registrations,
@@ -193,9 +202,9 @@ class _StreamingStats:
 class UAVMonitoringPipeline:
     """High-level orchestration for generic multi-sensor UAV workflows.
 
-    The core package has no manufacturer-specific sensor or band definitions.
-    All sensor metadata, band names and point-cloud dimensions come from the
-    project configuration or the method call.
+    The processing core has no manufacturer-specific assumptions. Optional
+    manufacturer presets live in ``uav_biodiv.sensors`` and only provide
+    metadata, semantic band roles and ready-to-use index definitions.
 
     Three representations remain explicitly separated:
 
@@ -1088,7 +1097,7 @@ class UAVMonitoringPipeline:
 
         metadata_payload = {
             "schema": "uav_biodiv.analysis_ready.v1",
-            "software": {"name": "uav-biodiv", "version": "0.9.1"},
+            "software": {"name": "uav-biodiv", "version": "0.9.3"},
             "fusion_method": "Multimodal co-registration and analysis-ready data fusion",
             "values": {
                 "cross_sensor_value_fusion": False,
@@ -1369,6 +1378,423 @@ class UAVMonitoringPipeline:
         return result
 
     # ------------------------------------------------------------------
+    # Additive EBV/ECV example workflow with optional sensor presets
+    # ------------------------------------------------------------------
+    def run_forest_multisensor_example(
+        self,
+        *,
+        dsm_path: str | Path,
+        dtm_path: str | Path,
+        multispectral_path: str | Path,
+        habitat_path: str | Path,
+        output_dir: str | Path,
+        lst_path: str | Path | None = None,
+        lst_band: int = 1,
+        lst_reference: float | None = None,
+        sensor: str | Mapping[str, Any] | None = None,
+        lidar_sensor: str | Mapping[str, Any] | None = None,
+        band_map: Mapping[str, int] | None = None,
+        index_definitions: Mapping[str, Mapping[str, Any]] | None = None,
+        indices: Iterable[str] | None = ("ndvi", "gndvi", "ndre"),
+        class_mapping: Mapping[int, str] | None = None,
+        forest_class: int = 1,
+        ndvi_threshold: float = 0.5,
+        ndre_threshold: float = 0.2,
+        train_random_forest: bool = True,
+        random_state: int = 42,
+        nodata: float = -9999.0,
+    ) -> dict[str, Any]:
+        """Run the forest EBV/ECV example without changing existing workflows.
+
+        The method is intentionally additive. Existing point-cloud and raster
+        fusion methods are called internally and keep their current defaults.
+
+        ``sensor`` may be a built-in multispectral preset, an explicit sensor
+        dictionary, or ``None``. With ``None``, ``band_map`` and
+        ``index_definitions`` must be supplied explicitly when indices are
+        requested. ``lidar_sensor`` is provenance metadata only for this
+        DSM/DTM workflow; it never guesses LAS/LAZ dimension names.
+
+        ``lst_path`` is optional. When supplied, the LST raster is harmonised
+        to the multispectral reference grid and an ``lst_anomaly`` layer is
+        computed. If ``lst_reference`` is ``None``, the valid-scene mean LST
+        is used as the anomaly reference.
+        """
+        import rasterio
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Sensor definitions are optional convenience metadata, not core rules.
+        sensor_definition = (
+            get_multispectral_sensor(sensor) if sensor is not None else None
+        )
+        lidar_definition = (
+            get_lidar_sensor(lidar_sensor) if lidar_sensor is not None else None
+        )
+
+        if band_map is None:
+            if sensor is None:
+                raise ValueError(
+                    "Provide sensor=... or an explicit multispectral band_map"
+                )
+            band_map = multispectral_band_map(sensor)
+        band_map = {str(k): int(v) for k, v in band_map.items()}
+
+        if index_definitions is None:
+            if sensor is not None:
+                index_definitions = multispectral_index_definitions(sensor)
+            else:
+                index_definitions = {}
+        resolved_indices = {
+            str(k): dict(v) for k, v in index_definitions.items()
+        }
+        if indices is not None:
+            wanted = [str(x).lower() for x in indices]
+            lookup = {str(k).lower(): str(k) for k in resolved_indices}
+            missing = [x for x in wanted if x not in lookup]
+            if missing:
+                raise KeyError(
+                    f"Requested indices are not defined: {missing}. "
+                    f"Available: {sorted(resolved_indices)}"
+                )
+            resolved_indices = {
+                lookup[x]: resolved_indices[lookup[x]] for x in wanted
+            }
+
+        collisions = set(band_map).intersection({"chm", "habitat"})
+        if collisions:
+            raise ValueError(
+                f"Multispectral band names collide with workflow names: {sorted(collisions)}"
+            )
+
+        # 1. Structural product.
+        chm_path = output_dir / "chm.tif"
+        compute_chm_from_dsm_dtm(
+            dsm_path,
+            dtm_path,
+            chm_path,
+            tile_size=self.config.processing_limits.raster_tile(bands=2),
+        )
+
+        # 2. Put structural, spectral and categorical data on one grid and
+        #    derive requested indices using the generic raster engine.
+        raster_sources: dict[str, RasterSource] = {
+            name: (multispectral_path, band)
+            for name, band in band_map.items()
+        }
+        raster_sources["chm"] = (chm_path, 1)
+        raster_sources["habitat"] = (habitat_path, 1)
+        if lst_path is not None:
+            raster_sources["lst"] = (lst_path, int(lst_band))
+
+        resampling = {name: "bilinear" for name in band_map}
+        resampling["chm"] = "bilinear"
+        resampling["habitat"] = "nearest"
+        if lst_path is not None:
+            resampling["lst"] = "bilinear"
+
+        features_path = output_dir / "forest_multisensor_features.tif"
+        features_result = self.run_raster_fusion(
+            raster_sources=raster_sources,
+            output_path=features_path,
+            reference_key=next(iter(band_map)),
+            resampling=resampling,
+            compute_indices=bool(resolved_indices),
+            index_definitions=resolved_indices,
+            anomaly_keys=("lst",) if lst_path is not None else (),
+            anomaly_references=(
+                {"lst": float(lst_reference)}
+                if lst_path is not None and lst_reference is not None
+                else None
+            ),
+            include_original=True,
+            nodata=nodata,
+        )
+
+        raster = self.ingestion.load_raster_data(features_path)
+        names = list(features_result["band_names"])
+        arrays = {
+            name: np.asarray(raster.data[i], dtype=np.float32)
+            for i, name in enumerate(names)
+        }
+        profile = dict(raster.profile)
+
+        habitat = arrays["habitat"]
+        valid_habitat = np.isfinite(habitat) & ~np.isclose(habitat, nodata)
+        habitat_classes = np.full(habitat.shape, -2147483648, dtype=np.int32)
+        habitat_classes[valid_habitat] = np.rint(habitat[valid_habitat]).astype(np.int32)
+
+        if class_mapping is None:
+            codes = sorted(int(x) for x in np.unique(habitat_classes[valid_habitat]))
+            class_mapping = {code: f"class_{code}" for code in codes}
+        else:
+            class_mapping = {int(k): str(v) for k, v in class_mapping.items()}
+
+        transform = profile.get("transform")
+        if transform is None:
+            raise ValueError("Analysis raster has no affine transform")
+        pixel_area = abs(
+            float(transform.a * transform.e - transform.b * transform.d)
+        )
+
+        ecosystem_extent = self.ebv_ecv.derive_ecosystem_extent(
+            habitat_classes,
+            class_mapping,
+            pixel_area,
+        )
+
+        forest_mask = valid_habitat & (habitat_classes == int(forest_class))
+        canopy_metrics = self.ebv_ecv.derive_canopy_structure_metrics(
+            arrays["chm"],
+            mask=forest_mask,
+            nodata=nodata,
+        )
+
+        output_paths: dict[str, str] = {
+            "chm": str(chm_path),
+            "features": str(features_path),
+        }
+
+        # Write every requested vegetation index as a separate GeoTIFF.
+        for name in resolved_indices:
+            index_path = output_dir / f"{name}.tif"
+            self._write_single_band_raster(
+                index_path,
+                arrays[name],
+                profile,
+                description=name.upper(),
+                nodata=nodata,
+                dtype="float32",
+            )
+            output_paths[name] = str(index_path)
+
+        # 3. Optional LST-anomaly ECV.
+        lst_metrics = None
+        if lst_path is not None and "lst_anomaly" in arrays:
+            lst_anomaly = np.asarray(arrays["lst_anomaly"], dtype=np.float32)
+            valid_lst = np.isfinite(lst_anomaly) & ~np.isclose(lst_anomaly, nodata)
+
+            lst_anomaly_path = output_dir / "lst_anomaly.tif"
+            self._write_single_band_raster(
+                lst_anomaly_path,
+                lst_anomaly,
+                profile,
+                description="LST_anomaly",
+                nodata=nodata,
+                dtype="float32",
+            )
+            output_paths["lst_anomaly"] = str(lst_anomaly_path)
+
+            if np.any(valid_lst):
+                anomaly_values = lst_anomaly[valid_lst].astype(np.float64)
+                reference_value = features_result["qa"].get(
+                    "anomaly_references", {}
+                ).get("lst")
+                lst_metrics = {
+                    "reference_lst": (
+                        float(reference_value)
+                        if reference_value is not None
+                        else None
+                    ),
+                    "mean_anomaly": float(np.mean(anomaly_values)),
+                    "std_anomaly": float(np.std(anomaly_values)),
+                    "min_anomaly": float(np.min(anomaly_values)),
+                    "max_anomaly": float(np.max(anomaly_values)),
+                    "p95_absolute_anomaly": float(
+                        np.percentile(np.abs(anomaly_values), 95)
+                    ),
+                }
+
+        # 4. Forest-condition EBV from NDVI + NDRE when both are available.
+        health_path: Path | None = None
+        if "ndvi" in arrays and "ndre" in arrays:
+            ndvi = np.asarray(arrays["ndvi"], dtype=np.float32)
+            ndre = np.asarray(arrays["ndre"], dtype=np.float32)
+            valid_health = (
+                np.isfinite(ndvi)
+                & np.isfinite(ndre)
+                & ~np.isclose(ndvi, nodata)
+                & ~np.isclose(ndre, nodata)
+            )
+            health = self.ebv_ecv.forest_health_from_indices(
+                ndvi,
+                ndre,
+                ndvi_threshold=ndvi_threshold,
+                ndre_threshold=ndre_threshold,
+            )
+            health_output = np.full(health.shape, 255, dtype=np.uint8)
+            health_output[valid_health] = health[valid_health].astype(np.uint8)
+            health_path = output_dir / "forest_health.tif"
+            self._write_single_band_raster(
+                health_path,
+                health_output,
+                profile,
+                description="forest_health",
+                nodata=255,
+                dtype="uint8",
+            )
+            output_paths["forest_health"] = str(health_path)
+
+        # 5. Optional Random Forest example using CHM + NDVI + NDRE.
+        classification = None
+        classification_path: Path | None = None
+        classification_features = [
+            name for name in ("chm", "ndvi", "ndre") if name in arrays
+        ]
+        if train_random_forest:
+            if len(classification_features) < 2:
+                raise ValueError(
+                    "Random Forest example requires CHM and at least one "
+                    "configured vegetation index"
+                )
+            valid = valid_habitat.copy()
+            for name in classification_features:
+                arr = arrays[name]
+                valid &= np.isfinite(arr) & ~np.isclose(arr, nodata)
+            if not np.any(valid):
+                raise ValueError("No valid pixels are available for Random Forest training")
+
+            x = np.column_stack([arrays[name][valid] for name in classification_features])
+            y = habitat_classes[valid]
+            self.ai.train_rf_classifier(
+                x,
+                y,
+                feature_names=classification_features,
+                random_state=random_state,
+            )
+            predicted = self.ai.predict_classes(x)
+            classification = self.validation.confusion_matrix(y, predicted)
+            classification["feature_importances"] = self.ai.feature_importances()
+            classification["evaluation_note"] = (
+                "Example workflow accuracy is resubstitution accuracy because "
+                "the habitat raster supplies both training labels and the "
+                "reference comparison. Use independent validation data for "
+                "scientific accuracy assessment."
+            )
+
+            prediction = np.full(habitat.shape, -2147483648, dtype=np.int32)
+            prediction[valid] = predicted.astype(np.int32)
+            classification_path = output_dir / "rf_habitat_classification.tif"
+            self._write_single_band_raster(
+                classification_path,
+                prediction,
+                profile,
+                description="rf_habitat_classification",
+                nodata=-2147483648,
+                dtype="int32",
+            )
+            output_paths["rf_classification"] = str(classification_path)
+
+        report = self.validation.summary_report(
+            ebv_metrics=ecosystem_extent,
+            canopy_metrics=canopy_metrics,
+            ecv_metrics=lst_metrics,
+            classification=classification,
+        )
+        report_path = output_dir / "forest_ebv_ecv_summary.txt"
+        report_path.write_text(report, encoding="utf-8")
+        output_paths["summary_report"] = str(report_path)
+
+        metrics = {
+            "workflow": "forest_multisensor_example",
+            "multispectral_sensor": sensor_definition,
+            "lidar_sensor": lidar_definition,
+            "band_map": band_map,
+            "index_definitions": resolved_indices,
+            "ecosystem_extent_m2": ecosystem_extent,
+            "canopy_structure": canopy_metrics,
+            "lst_anomaly": lst_metrics,
+            "classification": classification,
+            "outputs": output_paths,
+        }
+        metrics_path = output_dir / "forest_ebv_ecv_metrics.json"
+        write_json(metrics_path, metrics)
+        output_paths["metrics_json"] = str(metrics_path)
+
+        return {
+            "outputs": output_paths,
+            "ecosystem_extent": ecosystem_extent,
+            "canopy_metrics": canopy_metrics,
+            "lst_anomaly": lst_metrics,
+            "classification": classification,
+            "multispectral_sensor": sensor_definition,
+            "lidar_sensor": lidar_definition,
+        }
+
+    def run_forest_dji_m3m_lidar_example(
+        self,
+        *,
+        dsm_path: str | Path,
+        dtm_path: str | Path,
+        multispectral_path: str | Path,
+        habitat_path: str | Path,
+        output_dir: str | Path,
+        lst_path: str | Path | None = None,
+        lst_band: int = 1,
+        lst_reference: float | None = None,
+        sensor: str | Mapping[str, Any] = "dji_mavic_3m",
+        lidar_sensor: str | Mapping[str, Any] = "dji_zenmuse_l2",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Compatibility wrapper for the documented DJI forest example.
+
+        Both sensor parameters remain configurable; the implementation delegates
+        to the generic multisensor workflow.
+        """
+        return self.run_forest_multisensor_example(
+            dsm_path=dsm_path,
+            dtm_path=dtm_path,
+            multispectral_path=multispectral_path,
+            habitat_path=habitat_path,
+            output_dir=output_dir,
+            lst_path=lst_path,
+            lst_band=lst_band,
+            lst_reference=lst_reference,
+            sensor=sensor,
+            lidar_sensor=lidar_sensor,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _write_single_band_raster(
+        path: str | Path,
+        array: np.ndarray,
+        profile: Mapping[str, Any],
+        *,
+        description: str,
+        nodata: float | int,
+        dtype: str,
+    ) -> Path:
+        """Write one derived raster while preserving the common analysis grid."""
+        import rasterio
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        out_profile = dict(profile)
+        # Do not inherit strip/block sizes that can become invalid when the
+        # derived product is written as a tiled GeoTIFF.
+        out_profile.pop("blockxsize", None)
+        out_profile.pop("blockysize", None)
+        out_profile.update(
+            driver="GTiff",
+            count=1,
+            dtype=dtype,
+            nodata=nodata,
+            compress="deflate",
+            tiled=True,
+            BIGTIFF="YES",
+        )
+        values = np.asarray(array)
+        if np.issubdtype(values.dtype, np.floating):
+            values = np.where(np.isfinite(values), values, nodata)
+        values = np.asarray(values, dtype=dtype)
+        with rasterio.open(path, "w", **out_profile) as dst:
+            dst.write(values, 1)
+            dst.set_band_description(1, description)
+        return path
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod
@@ -1573,7 +1999,7 @@ class UAVMonitoringPipeline:
             variables.append(item)
         payload = {
             "schema": "uav_biodiv.point_analysis_ready.v1",
-            "software": {"name": "uav-biodiv", "version": "0.9.1"},
+            "software": {"name": "uav-biodiv", "version": "0.9.3"},
             "fusion_method": "geometric point-cloud co-registration and attribute-preserving fusion",
             "fusion_mode": str(fusion_mode),
             "aoi": (

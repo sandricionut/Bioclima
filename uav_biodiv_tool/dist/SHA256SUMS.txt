@@ -1,2 +1,2 @@
-de3ff4cad6fa71c3bb2ce11cd35440c879cdcbb34248a8e04a714a7c08b19691  dist/uav_biodiv-0.9.1-py3-none-any.whl
-a0c77fda5c24927c0f18518db2382094d78ad727bb919199fc9149d6b6c35cfe  dist/uav_biodiv-0.9.1.tar.gz
+5c215be05ed00f4c5b1335deea9d87e93f0546f65ccdb9fa7f3bf81ac1d55a68  uav_biodiv-0.9.3-py3-none-any.whl
+c698981faaf753c8a90247c6de98fabbb08b665b38aee0acd82a4428d4ec8469  uav_biodiv-0.9.3.tar.gz

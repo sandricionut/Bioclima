@@ -126,6 +126,7 @@ class ValidationReporting:
         *,
         ebv_metrics: Mapping[str, Any] | None = None,
         canopy_metrics: Mapping[str, Any] | None = None,
+        ecv_metrics: Mapping[str, Any] | None = None,
         classification: Mapping[str, Any] | None = None,
         point_cloud: Mapping[str, Any] | None = None,
         raster_fusion: Mapping[str, Any] | None = None,
@@ -135,6 +136,8 @@ class ValidationReporting:
             blocks.append("[EBV] Essential Biodiversity Variables – Ecosystem Extent (m²)\n" + json.dumps(dict(ebv_metrics), indent=2))
         if canopy_metrics is not None:
             blocks.append("[EBV] Essential Biodiversity Variables – Canopy Structure Metrics\n" + json.dumps(dict(canopy_metrics), indent=2))
+        if ecv_metrics is not None:
+            blocks.append("[ECV] Essential Climate Variables – LST Anomaly\n" + json.dumps(dict(ecv_metrics), indent=2))
         if classification is not None:
             blocks.append("[VALIDATION] Classification\n" + json.dumps(dict(classification), indent=2))
         if point_cloud is not None:

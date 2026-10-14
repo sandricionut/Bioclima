@@ -1,4 +1,4 @@
-"""Generic AOI examples for uav_biodiv v0.9.1.
+"""Generic AOI examples for uav_biodiv v0.9.3.
 
 The AOI controls the output/fusion extent. By default, registration is still
 estimated from the full available overlap so changing the AOI does not change

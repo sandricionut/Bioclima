@@ -1,8 +1,10 @@
+
 from pathlib import Path
 from contextlib import contextmanager
 from threading import Event, Thread
-from time import perf_counter
 import multiprocessing
+
+from tqdm import tqdm
 
 from uav_biodiv import UAVProjectConfig, UAVMonitoringPipeline
 
@@ -47,23 +49,31 @@ def find(name):
 
 
 @contextmanager
-def progress(label, interval=5):
+def progress(label, refresh_interval=0.5):
+    """Keep one live tqdm line while a long pipeline operation is running."""
     stop = Event()
-    start = perf_counter()
-    print(f"\n▶ {label}", flush=True)
+    bar = tqdm(
+        total=None,
+        desc=label,
+        dynamic_ncols=True,
+        leave=True,
+        bar_format="{desc}  {elapsed}",
+    )
 
-    def heartbeat():
-        while not stop.wait(interval):
-            print(f"  ... {perf_counter() - start:.0f} s elapsed", flush=True)
+    def refresher():
+        while not stop.wait(refresh_interval):
+            bar.refresh()
 
-    thread = Thread(target=heartbeat, daemon=True)
+    thread = Thread(target=refresher, daemon=True)
     thread.start()
     try:
         yield
     finally:
         stop.set()
         thread.join(timeout=0.2)
-        print(f"✓ finished in {perf_counter() - start:.1f} s", flush=True)
+        bar.set_description_str(f"{label} ✓")
+        bar.refresh()
+        bar.close()
 
 
 # ============================================================

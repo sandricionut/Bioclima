@@ -9,6 +9,12 @@ from .validation import ValidationReporting
 from .ebv_ecv import EBVECVDerivation
 from .ai import AIAnalytics
 from .aoi import AOISelection
+from .sensors import (
+    LIDAR_SENSORS,
+    MULTISPECTRAL_SENSORS,
+    get_lidar_sensor,
+    get_multispectral_sensor,
+)
 
 __all__ = [
     "UAVProjectConfig",
@@ -24,6 +30,10 @@ __all__ = [
     "EBVECVDerivation",
     "AIAnalytics",
     "AOISelection",
+    "LIDAR_SENSORS",
+    "MULTISPECTRAL_SENSORS",
+    "get_lidar_sensor",
+    "get_multispectral_sensor",
 ]
 
-__version__ = "0.9.1"
+__version__ = "0.9.3"
